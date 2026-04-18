@@ -4,6 +4,10 @@ A news screensaver for Hyprland (Wayland) that displays live tech and cyber secu
 
 ![screenshot](screenshot.png)
 
+Click any card to expand it in-place and read the full article:
+
+![article view](screenshot-article.png)
+
 ## Features
 
 - **Live news cards** -- fetches headlines from configurable RSS feeds and displays them as interactive cards

@@ -194,8 +194,8 @@ def fetch_feeds():
                 title = html.unescape(entry.get("title", ""))
                 sc = re.sub(r"<[^>]+>", "", html.unescape(entry.get("summary", "")))
                 sc = clean_hn(sc)
-                if len(sc) > 120:
-                    sc = sc[:117] + "..."
+                if len(sc) > 250:
+                    sc = sc[:247] + "..."
                 pub = entry.get("published", entry.get("updated", ""))
                 try:
                     from email.utils import parsedate_to_datetime
@@ -291,9 +291,29 @@ def save_cache(items):
     for item in no_text:
         item["browser_only"] = True
 
-    # main cards from readable, mini grid from browser-only + overflow
-    sorted_items = has_text[:MAX_MAIN] + no_text + has_text[MAX_MAIN:]
-    sorted_items = sorted_items[:MAX_TOTAL]
+    # within each group, prioritise items WITH images over those without
+    def has_img(item):
+        return bool(item.get("cached_image")) and os.path.exists(item.get("cached_image", ""))
+
+    has_text_img = [i for i in has_text if has_img(i)]
+    has_text_noimg = [i for i in has_text if not has_img(i)]
+    no_text_img = [i for i in no_text if has_img(i)]
+    no_text_noimg = [i for i in no_text if not has_img(i)]
+
+    # main cards: prefer items with text AND image
+    # mini grid: prefer items with image
+    # items without images go to the very end (least visible slots)
+    main_pool = has_text_img + has_text_noimg
+    mini_pool = no_text_img + has_text_img[MAX_MAIN:] + has_text_noimg[MAX_MAIN:] + no_text_noimg
+
+    sorted_items = main_pool[:MAX_MAIN]
+    remaining = mini_pool + main_pool[MAX_MAIN:]
+    # deduplicate (items might be in both pools)
+    seen = set(id(i) for i in sorted_items)
+    for item in remaining:
+        if id(item) not in seen and len(sorted_items) < MAX_TOTAL:
+            sorted_items.append(item)
+            seen.add(id(item))
 
     # copy images to final numbered positions
     import shutil

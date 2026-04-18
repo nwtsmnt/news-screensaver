@@ -192,8 +192,8 @@ def fetch_news():
                 title = html.unescape(entry.get("title", ""))
                 sc = re.sub(r"<[^>]+>", "", html.unescape(entry.get("summary", "")))
                 sc = _clean_hn_summary(sc)  # strip HN metadata
-                if len(sc) > 120:
-                    sc = sc[:117] + "..."
+                if len(sc) > 250:
+                    sc = sc[:247] + "..."
                 # extract publish date
                 pub = entry.get("published", entry.get("updated", ""))
                 try:
@@ -614,12 +614,16 @@ class NewsScreensaver(Gtk.Application):
         threading.Thread(target=self._force_refresh, daemon=True).start()
 
     def _force_refresh(self):
-        """Manual refresh — show text fast, then images."""
-        items = fetch_and_cache()
-        GLib.idle_add(self._populate_news, items)
-        # images in background
-        download_all_images(items)
-        GLib.idle_add(self._populate_news, items)
+        """Manual refresh — run cache updater, then reload from cache."""
+        import subprocess
+        try:
+            subprocess.run(["/home/new_testament/.local/bin/news-cache-updater"],
+                          timeout=30, capture_output=True)
+        except Exception:
+            pass
+        cached = _load_cache()
+        if cached:
+            GLib.idle_add(self._populate_news, cached)
 
     def _populate_news(self, items):
         # clear old cards
@@ -702,6 +706,7 @@ class NewsScreensaver(Gtk.Application):
                 tex = Gdk.Texture.new_for_pixbuf(pb)
                 img = Gtk.Picture.new_for_paintable(tex)
                 img.set_content_fit(Gtk.ContentFit.COVER)
+                img.set_can_shrink(True)
                 img.set_halign(Gtk.Align.FILL)
                 img.set_hexpand(True)
                 if kind == "card":
@@ -719,11 +724,13 @@ class NewsScreensaver(Gtk.Application):
                 else:
                     img.set_size_request(-1, 80)
                     img.set_hexpand(True)
+                    img.set_vexpand(False)
                     img.add_css_class("mini-image")
                     img_frame = Gtk.Box()
                     img_frame.set_size_request(-1, 80)
                     img_frame.set_overflow(Gtk.Overflow.HIDDEN)
                     img_frame.set_halign(Gtk.Align.FILL)
+                    img_frame.set_vexpand(False)
                     img_frame.set_hexpand(True)
                     img_frame.append(img)
                     c = holder.get_first_child()
@@ -845,8 +852,10 @@ class NewsScreensaver(Gtk.Application):
         t.set_wrap(True); t.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         t.set_max_width_chars(38); t.set_xalign(0)
         tb.append(t)
-        if item["summary"]:
-            sm = Gtk.Label(label=item["summary"])
+        # use summary for card preview (always clean from RSS)
+        summary = item.get("summary", "")
+        if summary:
+            sm = Gtk.Label(label=summary)
             sm.add_css_class("card-summary"); sm.set_halign(Gtk.Align.START)
             sm.set_wrap(True); sm.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
             sm.set_max_width_chars(38); sm.set_xalign(0)
@@ -1023,6 +1032,16 @@ class NewsScreensaver(Gtk.Application):
         self._article_widgets.append(body_scroll)
 
         card.set_size_request(1240, -1)
+
+        # expand image height for article view
+        _, _, ih = self._cards[index]
+        if ih.get_visible():
+            frame = ih.get_first_child()
+            if frame:
+                frame.set_size_request(-1, 300)
+                pic = frame.get_first_child()
+                if pic:
+                    pic.set_size_request(-1, 300)
 
         # fetch more if short
         if len(body) < 500 and item.get("link"):
@@ -1267,6 +1286,16 @@ class NewsScreensaver(Gtk.Application):
                     crd.remove(widget)
                 crd.set_size_request(400, -1)
 
+                # restore image to card size
+                _, _, ih = self._cards[self._expanded_index]
+                if ih.get_visible():
+                    frame = ih.get_first_child()
+                    if frame:
+                        frame.set_size_request(-1, 200)
+                        pic = frame.get_first_child()
+                        if pic:
+                            pic.set_size_request(-1, 200)
+
             self._article_widgets = []
 
             # show all remaining cards
@@ -1434,16 +1463,17 @@ class NewsScreensaver(Gtk.Application):
             max-height: 200px;
         }
         .card-source {
-            font-size: 11px; font-weight: 600; letter-spacing: 1.5px;
+            font-size: 12px; font-weight: 600; letter-spacing: 1.5px;
             color: rgba(120,180,255,0.8);
         }
         .card-title {
-            font-size: 17px; font-weight: 500;
-            color: rgba(255,255,255,0.92);
+            font-size: 19px; font-weight: 600;
+            color: rgba(255,255,255,0.95);
         }
         .card-summary {
-            font-size: 13px; font-weight: 300;
-            color: rgba(255,255,255,0.45);
+            font-size: 14px; font-weight: 400;
+            color: rgba(255,255,255,0.55);
+            line-height: 1.5;
         }
         .article-divider {
             background-color: rgba(255,255,255,0.1); min-height: 1px;
@@ -1476,12 +1506,12 @@ class NewsScreensaver(Gtk.Application):
             border-radius: 10px 10px 0 0;
         }
         .mini-source {
-            font-size: 9px; font-weight: 700; letter-spacing: 1.2px;
+            font-size: 10px; font-weight: 700; letter-spacing: 1.2px;
             color: rgba(120,180,255,0.85);
         }
         .mini-title {
-            font-size: 13px; font-weight: 600;
-            color: rgba(255,255,255,0.9);
+            font-size: 14px; font-weight: 600;
+            color: rgba(255,255,255,0.92);
         }
         .card-date {
             font-size: 10px; font-weight: 300;
