@@ -1,0 +1,10 @@
+general {
+    lock_cmd = pidof news-screensaver || news-toggle
+    unlock_cmd =
+}
+
+listener {
+    timeout = 420  # 7 minutes
+    on-timeout = pidof news-screensaver || news-toggle
+    on-resume =
+}

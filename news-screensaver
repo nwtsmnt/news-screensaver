@@ -1,0 +1,1532 @@
+#!/usr/bin/env python3
+"""
+News screensaver overlay for Hyprland.
+Click card → it grows in-place to show article. Drag up to dismiss.
+"""
+
+import os, sys
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+gi.require_version("GdkPixbuf", "2.0")
+
+from gi.repository import Gtk, Gtk4LayerShell, Gdk, GLib, Pango, GdkPixbuf
+import threading, html, re, os, tempfile, json
+from datetime import datetime
+from pathlib import Path
+
+RSS_FEEDS = [
+    ("Cloudflare", "https://blog.cloudflare.com/rss/", 1),
+    ("The Register", "https://www.theregister.com/headlines.atom", 2),
+    ("Hacker News", "https://hnrss.org/frontpage", 2),
+    ("BBC London", "https://feeds.bbci.co.uk/news/england/london/rss.xml", 2),
+    ("Dark Reading", "https://www.darkreading.com/rss.xml", 2),
+    ("Krebs on Security", "https://krebsonsecurity.com/feed/", 2),
+    ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index", 2),
+]
+MAX_MAIN = 5   # full-size cards
+MAX_MINI = 4   # mini headlines in the 6th slot
+DRAG_THRESHOLD = 150
+CLICK_THRESHOLD = 8
+
+JUNK_RE = re.compile(
+    r"^\s*(Share|Save|Print|Email|Copy link|Related Topics|More on this story"
+    r"|Follow us|Subscribe|Sign up|Newsletter|Advertisement"
+    r"|Image source|Getty Images|Reuters|PA Media|AFP"
+    r"|Add as preferred on Google|Listen|Watch|Read more"
+    r"|Send your story|\d+ (hour|minute|day|second)s? ago"
+    r"|Article URL:\s*https?://.*|Comments URL:\s*https?://.*"
+    r"|Points:\s*\d+|# Comments:\s*\d+"
+    r"|Available on iOS.*|Download on the App Store"
+    r"|Get it on Google Play)\s*$",
+    re.IGNORECASE | re.MULTILINE)
+
+def _clean_hn_summary(text):
+    """Strip HN metadata from summary."""
+    text = re.sub(r"Article URL:\s*https?://\S+", "", text)
+    text = re.sub(r"Comments URL:\s*https?://\S+", "", text)
+    text = re.sub(r"Points:\s*\d+", "", text)
+    text = re.sub(r"# Comments:\s*\d+", "", text)
+    return text.strip()
+
+
+def _extract_image(entry):
+    for src in [
+        lambda: entry.get("media_thumbnail", [{}])[0].get("url"),
+        lambda: next((m.get("url") for m in entry.get("media_content", [])
+                       if "image" in m.get("type", "") or
+                       m.get("url", "").endswith((".jpg", ".png", ".webp"))), None),
+        lambda: next((e.get("url") for e in entry.get("enclosures", [])
+                       if "image" in e.get("type", "")), None),
+        lambda: re.search(r'<img[^>]+src=["\']([^"\']+)["\']',
+                          entry.get("summary", "") +
+                          (entry.get("content", [{}])[0].get("value", "")
+                           if entry.get("content") else ""))
+    ]:
+        try:
+            r = src()
+            if r:
+                return r.group(1) if hasattr(r, "group") else r
+        except (IndexError, StopIteration, TypeError):
+            pass
+    return ""
+
+
+def _clean_text(raw):
+    raw = re.sub(r"<script[^>]*>.*?</script>", "", raw, flags=re.DOTALL)
+    raw = re.sub(r"<style[^>]*>.*?</style>", "", raw, flags=re.DOTALL)
+    raw = re.sub(r"<br\s*/?>", "\n", raw)
+    raw = re.sub(r"</p>", "\n\n", raw)
+    raw = re.sub(r"<[^>]+>", "", raw)
+    raw = html.unescape(raw)
+    lines = [s.strip() for s in raw.split("\n")]
+    lines = [l for l in lines if l == "" or (len(l) >= 3 and not JUNK_RE.match(l))]
+    raw = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    return raw[:4000]
+
+
+def _extract_full_text(entry):
+    texts = []
+    if entry.get("content"):
+        texts.extend(c.get("value", "") for c in entry["content"])
+    if entry.get("summary_detail", {}).get("value"):
+        texts.append(entry["summary_detail"]["value"])
+    if entry.get("summary"):
+        texts.append(entry["summary"])
+    return _clean_text(max(texts, key=len)) if texts else ""
+
+
+def _fetch_og_image(url):
+    """Fetch og:image from an article URL."""
+    import requests
+    if not url:
+        return ""
+    try:
+        r = requests.get(url, timeout=3, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return ""
+        # look for og:image
+        m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', r.text, re.IGNORECASE)
+        if not m:
+            m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', r.text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+        # try twitter:image
+        m = re.search(r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']', r.text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
+def _upgrade_image_url(url):
+    """Try to get a higher-resolution version of known image CDN URLs."""
+    if not url:
+        return url
+    # BBC: replace /standard/240/ with /standard/960/
+    url = re.sub(r"/standard/\d+/", "/standard/960/", url)
+    # also try removing size constraints from common CDNs
+    url = re.sub(r"\?w=\d+", "?w=800", url)
+    return url
+
+
+def _download_image(url, index):
+    import requests
+    if not url:
+        return None
+    url = _upgrade_image_url(url)
+    try:
+        r = requests.get(url, timeout=3, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200 and len(r.content) > 500:
+            ct = r.headers.get("content-type", "")
+            ext = ".png" if "png" in ct else ".webp" if "webp" in ct else ".jpg"
+            path = os.path.join(tempfile.gettempdir(), f"news-ss-{index}{ext}")
+            with open(path, "wb") as f:
+                f.write(r.content)
+            return path
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_article_text(url):
+    import requests
+    try:
+        r = requests.get(url, timeout=5, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            "Accept": "text/html",
+        })
+        if r.status_code != 200:
+            return ""
+        t = r.text
+        # try extracting content from semantic tags (greedy, last match)
+        best = ""
+        for tag in ["article", "main", "div[^>]*class=\"[^\"]*content[^\"]*\""]:
+            # use greedy .* to get the largest match
+            pattern = rf"<{tag}[^>]*>(.*)</{tag.split('[')[0]}>"
+            m = re.search(pattern, t, re.DOTALL | re.IGNORECASE)
+            if m:
+                candidate = _clean_text(m.group(1))
+                if len(candidate) > len(best):
+                    best = candidate
+        if not best:
+            # fallback: extract body
+            m = re.search(r"<body[^>]*>(.*)</body>", t, re.DOTALL | re.IGNORECASE)
+            if m:
+                best = _clean_text(m.group(1))
+        return best[:5000]
+    except Exception:
+        return ""
+
+
+def fetch_news():
+    import feedparser
+    items, results = [], [None] * len(RSS_FEEDS)
+    def fetch_feed(idx, source, url, count):
+        try:
+            feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
+            res = []
+            for entry in feed.entries[:count]:
+                title = html.unescape(entry.get("title", ""))
+                sc = re.sub(r"<[^>]+>", "", html.unescape(entry.get("summary", "")))
+                sc = _clean_hn_summary(sc)  # strip HN metadata
+                if len(sc) > 120:
+                    sc = sc[:117] + "..."
+                # extract publish date
+                pub = entry.get("published", entry.get("updated", ""))
+                try:
+                    from email.utils import parsedate_to_datetime
+                    dt = parsedate_to_datetime(pub)
+                    pub_str = dt.strftime("%d %b %Y, %H:%M")
+                except Exception:
+                    pub_str = pub[:20] if pub else ""
+                res.append({"source": source, "title": title, "summary": sc,
+                            "full_text": _extract_full_text(entry),
+                            "link": entry.get("link", ""), "published": pub_str,
+                            "image_url": _extract_image(entry), "image_path": None})
+            results[idx] = res
+        except Exception:
+            results[idx] = []
+    threads = [threading.Thread(target=fetch_feed, args=(i, s, u, c), daemon=True)
+               for i, (s, u, c) in enumerate(RSS_FEEDS)]
+    for t in threads: t.start()
+    for t in threads: t.join(timeout=5)
+    for r in results:
+        if r: items.extend(r)
+    return items[:MAX_MAIN + MAX_MINI]
+
+
+CACHE_DIR = Path.home() / ".cache" / "news-screensaver"
+CACHE_FILE = CACHE_DIR / "cache.json"
+CACHE_IMG_DIR = CACHE_DIR / "images"
+
+
+def _save_cache(items):
+    """Save articles + image paths to disk."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_IMG_DIR.mkdir(exist_ok=True)
+
+    cache_items = []
+    for i, item in enumerate(items):
+        ci = {k: v for k, v in item.items() if k != "image_path"}
+        # copy image to cache dir if exists
+        src = item.get("image_path")
+        if src and os.path.exists(src):
+            ext = os.path.splitext(src)[1] or ".jpg"
+            dst = str(CACHE_IMG_DIR / f"img-{i}{ext}")
+            try:
+                import shutil
+                shutil.copy2(src, dst)
+                ci["cached_image"] = dst
+            except Exception:
+                ci["cached_image"] = ""
+        else:
+            ci["cached_image"] = ""
+        cache_items.append(ci)
+
+    data = {"updated": datetime.now().isoformat(), "items": cache_items}
+    try:
+        with open(CACHE_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def _load_cache():
+    """Load cached articles from disk. Returns list of items or None."""
+    try:
+        if not CACHE_FILE.exists():
+            return None
+        with open(CACHE_FILE) as f:
+            data = json.load(f)
+        items = data.get("items", [])
+        # restore image_path from cached_image
+        for item in items:
+            ci = item.pop("cached_image", "")
+            item["image_path"] = ci if ci and os.path.exists(ci) else None
+        return items if items else None
+    except Exception:
+        return None
+
+
+def fetch_and_cache():
+    """Fetch fresh news (text only, fast). Returns items without images."""
+    return fetch_news()
+
+
+def download_all_images(items):
+    """Download images for all items in parallel, then save cache."""
+    threads = []
+    for i, item in enumerate(items):
+        def dl(idx=i, it=item):
+            img_url = it.get("image_url", "")
+            if not img_url and it.get("link"):
+                img_url = _fetch_og_image(it["link"])
+                it["image_url"] = img_url
+            path = _download_image(img_url, idx)
+            if path:
+                it["image_path"] = path
+        t = threading.Thread(target=dl, daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=5)
+    _save_cache(items)
+
+
+class NewsScreensaver(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="com.breachfm.screensaver")
+        self._drag_start_y = self._drag_start_x = self._current_shift = 0
+        self._dragging = self._did_move = self._dismissing = False
+        self._article_open = False
+        self._expanded_index = -1
+        self._article_widgets = []
+        self._screen_height = 1080
+
+    def do_activate(self):
+        win = Gtk.ApplicationWindow(application=self)
+        self._win = win
+
+        Gtk4LayerShell.init_for_window(win)
+        Gtk4LayerShell.set_layer(win, Gtk4LayerShell.Layer.OVERLAY)
+        Gtk4LayerShell.set_namespace(win, "news-screensaver")
+        Gtk4LayerShell.set_exclusive_zone(win, -1)
+        for edge in [Gtk4LayerShell.Edge.TOP, Gtk4LayerShell.Edge.BOTTOM,
+                     Gtk4LayerShell.Edge.LEFT, Gtk4LayerShell.Edge.RIGHT]:
+            Gtk4LayerShell.set_anchor(win, edge, True)
+        Gtk4LayerShell.set_keyboard_mode(win, Gtk4LayerShell.KeyboardMode.EXCLUSIVE)
+        win.set_decorated(False)
+
+        # input controllers
+        press = Gtk.GestureClick()
+        press.set_propagation_phase(Gtk.PropagationPhase.BUBBLE)
+        press.connect("pressed", self._on_press)
+        press.connect("released", self._on_release)
+        win.add_controller(press)
+
+        motion = Gtk.EventControllerMotion()
+        motion.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        motion.connect("motion", self._on_motion)
+        win.add_controller(motion)
+
+        scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
+        scroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        scroll.connect("scroll", self._on_scroll)
+        win.add_controller(scroll)
+
+        key_ctrl = Gtk.EventControllerKey()
+        key_ctrl.connect("key-pressed", self._on_key)
+        win.add_controller(key_ctrl)
+
+        # CSS
+        css = Gtk.CssProvider()
+        css.load_from_string(self._get_css())
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+
+        # main panel with wallpaper background
+        self._panel = Gtk.Overlay()
+        self._panel.set_hexpand(True)
+        self._panel.set_vexpand(True)
+
+        # dark tint as initial background (wallpaper loads after window shows)
+        tint = Gtk.Box()
+        tint.set_hexpand(True)
+        tint.set_vexpand(True)
+        tint.add_css_class("screensaver-tint")
+        self._panel.add_overlay(tint)
+
+        # content overlay
+        content_layer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content_layer.set_hexpand(True)
+        content_layer.set_vexpand(True)
+        self._panel.add_overlay(content_layer)
+
+        # scroll wrapper for everything
+        self._scroll = Gtk.ScrolledWindow()
+        self._scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._scroll.set_hexpand(True)
+        self._scroll.set_vexpand(True)
+
+        self._content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self._content.set_halign(Gtk.Align.CENTER)
+        self._content.set_valign(Gtk.Align.CENTER)
+        self._content.set_vexpand(True)
+        self._content.set_margin_start(80)
+        self._content.set_margin_end(80)
+        self._content.set_margin_top(50)
+        self._content.set_margin_bottom(40)
+
+        # header (always visible)
+        header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        header.set_halign(Gtk.Align.CENTER)
+        self.clock_label = Gtk.Label()
+        self.clock_label.add_css_class("clock")
+        header.append(self.clock_label)
+        self.date_label = Gtk.Label()
+        self.date_label.add_css_class("date-label")
+        header.append(self.date_label)
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        sep.add_css_class("sep")
+        sep.set_margin_top(8)
+        sep.set_margin_bottom(8)
+        header.append(sep)
+        self._content.append(header)
+
+        # loading
+        self.loading_label = Gtk.Label(label="loading news...")
+        self.loading_label.add_css_class("loading")
+        self._content.append(self.loading_label)
+
+        # news grid
+        self.news_grid = Gtk.FlowBox()
+        self.news_grid.set_max_children_per_line(3)
+        self.news_grid.set_min_children_per_line(2)
+        self.news_grid.set_column_spacing(20)
+        self.news_grid.set_row_spacing(20)
+        self.news_grid.set_homogeneous(False)
+        self.news_grid.set_halign(Gtk.Align.CENTER)
+        self.news_grid.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.news_grid.connect("child-activated", self._on_card_activated)
+        self.news_grid.set_visible(False)
+        self._content.append(self.news_grid)
+
+        # refresh button
+        self._refresh_btn = Gtk.Label(label="\u21bb  refresh")
+        self._refresh_btn.add_css_class("refresh-btn")
+        self._refresh_btn.set_halign(Gtk.Align.CENTER)
+        self._refresh_btn.set_margin_top(16)
+        refresh_click = Gtk.GestureClick()
+        refresh_click.connect("pressed", self._on_refresh_clicked)
+        self._refresh_btn.add_controller(refresh_click)
+        self._content.append(self._refresh_btn)
+
+        # hint
+        self._hint = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._hint.set_halign(Gtk.Align.CENTER)
+        self._hint.set_margin_top(12)
+        a = Gtk.Label(label="\u2191")
+        a.add_css_class("hint-arrow")
+        self._hint.append(a)
+        h = Gtk.Label(label="drag up to unlock")
+        h.add_css_class("hint")
+        self._hint.append(h)
+        self._content.append(self._hint)
+
+        self._scroll.set_child(self._content)
+        content_layer.append(self._scroll)
+        win.set_child(self._panel)
+
+        self._update_clock()
+        GLib.timeout_add_seconds(1, self._update_clock)
+        threading.Thread(target=self._initial_load, daemon=True).start()
+        win.present()
+
+        display = Gdk.Display.get_default()
+        monitors = display.get_monitors()
+        if monitors.get_n_items() > 0:
+            self._screen_height = monitors.get_item(0).get_geometry().height
+
+        # slide-in animation from top
+        self._panel.set_margin_top(-self._screen_height)
+        self._slide_in_step = 0
+        GLib.timeout_add(16, self._slide_in_tick)
+
+        # load wallpaper in idle callback (after first frame)
+        GLib.idle_add(self._load_wallpaper)
+
+    def _load_wallpaper(self):
+        """Load wallpaper as background (called after window is shown)."""
+        wallpaper_path = self._find_wallpaper()
+        if wallpaper_path:
+            try:
+                wp_pb = GdkPixbuf.Pixbuf.new_from_file(wallpaper_path)
+                wp_tex = Gdk.Texture.new_for_pixbuf(wp_pb)
+                wp_img = Gtk.Picture.new_for_paintable(wp_tex)
+                wp_img.set_content_fit(Gtk.ContentFit.COVER)
+                wp_img.set_hexpand(True)
+                wp_img.set_vexpand(True)
+                self._panel.set_child(wp_img)
+            except Exception:
+                pass
+        return False  # don't repeat
+
+    def _find_wallpaper(self):
+        """Find current wallpaper, return a cached scaled-down version."""
+        # find the source wallpaper
+        src = None
+        wal_path = os.path.expanduser("~/.cache/wal/wal")
+        if os.path.exists(wal_path):
+            try:
+                with open(wal_path) as f:
+                    wp = f.read().strip()
+                if os.path.exists(wp):
+                    src = wp
+            except Exception:
+                pass
+        if not src:
+            for candidate in [
+                os.path.expanduser("~/Pictures/Wallpapers/2.png"),
+                os.path.expanduser("~/Pictures/Wallpapers/blue.png"),
+            ]:
+                if os.path.exists(candidate):
+                    src = candidate
+                    break
+        if not src:
+            return None
+
+        # use a cached scaled-down JPEG for fast loading
+        cache_wp = str(CACHE_DIR / "wallpaper-bg.jpg")
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        # rebuild if source changed or cache missing
+        if not os.path.exists(cache_wp) or os.path.getmtime(src) > os.path.getmtime(cache_wp):
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(src, 1920, 1080, True)
+                pb.savev(cache_wp, "jpeg", ["quality"], ["85"])
+            except Exception:
+                return src
+        return cache_wp
+
+    def _slide_in_tick(self):
+        self._slide_in_step += 1
+        p = min(1.0, self._slide_in_step / 50.0)
+        # ease out quint — smooth, slow deceleration
+        e = 1.0 - (1.0 - p) ** 5
+        margin = int(-self._screen_height * (1.0 - e))
+        self._panel.set_margin_top(margin)
+        if p >= 1.0:
+            self._panel.set_margin_top(0)
+            return False
+        return True
+
+    def _update_clock(self):
+        now = datetime.now()
+        self.clock_label.set_label(now.strftime("%H:%M"))
+        date_str = now.strftime("%A, %d %B %Y")
+        # show cache age
+        age = self._get_cache_age()
+        if age:
+            date_str += f"  \u00b7  news updated {age}"
+        self.date_label.set_label(date_str)
+
+        # auto-refresh if open for 30+ min and cache is stale
+        if not self._article_open and not getattr(self, '_auto_refreshed', False):
+            age_min = self._get_cache_age_minutes()
+            if age_min > 30:
+                self._auto_refreshed = True
+                threading.Thread(target=self._background_auto_refresh, daemon=True).start()
+        return True
+
+    def _get_cache_age(self):
+        try:
+            if not CACHE_FILE.exists():
+                return None
+            data = json.load(open(CACHE_FILE))
+            updated = datetime.fromisoformat(data["updated"])
+            delta = datetime.now() - updated
+            mins = int(delta.total_seconds() / 60)
+            if mins < 1:
+                return "just now"
+            elif mins < 60:
+                return f"{mins}m ago"
+            else:
+                return f"{mins // 60}h {mins % 60}m ago"
+        except Exception:
+            return None
+
+    def _get_cache_age_minutes(self):
+        try:
+            if not CACHE_FILE.exists():
+                return 999
+            data = json.load(open(CACHE_FILE))
+            updated = datetime.fromisoformat(data["updated"])
+            return int((datetime.now() - updated).total_seconds() / 60)
+        except Exception:
+            return 999
+
+    def _background_auto_refresh(self):
+        """Silent auto-refresh when cache is stale."""
+        import subprocess
+        try:
+            subprocess.run(["/home/new_testament/.local/bin/news-cache-updater"],
+                          timeout=60, capture_output=True)
+            cached = _load_cache()
+            if cached:
+                GLib.idle_add(self._populate_news, cached)
+        except Exception:
+            pass
+
+    def _initial_load(self):
+        """Load from cache (instant). Only fetch if no cache exists."""
+        cached = _load_cache()
+        if cached:
+            # instant — just show cached content, no network
+            GLib.idle_add(self._populate_news, cached)
+        else:
+            # no cache — fetch text, show, then images in background
+            items = fetch_and_cache()
+            GLib.idle_add(self._populate_news, items)
+            download_all_images(items)
+            GLib.idle_add(self._populate_news, items)
+
+    def _background_refresh(self):
+        """Fetch fresh news in background, then update UI + download images."""
+        items = fetch_and_cache()
+        GLib.idle_add(self._maybe_refresh_ui, items)
+        # download images after UI update
+        download_all_images(items)
+        # re-populate with images
+        GLib.idle_add(self._maybe_refresh_ui, items)
+
+    def _maybe_refresh_ui(self, items):
+        if self._article_open:
+            return
+        self._populate_news(items)
+
+    def _on_refresh_clicked(self, gesture, n_press, x, y):
+        if self._article_open:
+            return
+        self._refresh_btn.set_label("\u21bb  loading...")
+        threading.Thread(target=self._force_refresh, daemon=True).start()
+
+    def _force_refresh(self):
+        """Manual refresh — show text fast, then images."""
+        items = fetch_and_cache()
+        GLib.idle_add(self._populate_news, items)
+        # images in background
+        download_all_images(items)
+        GLib.idle_add(self._populate_news, items)
+
+    def _populate_news(self, items):
+        # clear old cards
+        while True:
+            child = self.news_grid.get_first_child()
+            if child is None:
+                break
+            self.news_grid.remove(child)
+
+        self.loading_label.set_visible(False)
+        self.news_grid.set_visible(True)
+        self._refresh_btn.set_label("\u21bb  refresh")
+
+        main_items = items[:MAX_MAIN]
+        mini_items = items[MAX_MAIN:MAX_MAIN + MAX_MINI]
+
+        self._cards = []
+        all_fb_children = []
+        for item in main_items:
+            card, ih = self._make_card(item)
+            self.news_grid.append(card)
+            self._cards.append((item, card, ih))
+
+        # 6th slot: mini-grid of extra headlines
+        if mini_items:
+            mini_card = self._make_mini_grid(mini_items)
+            self.news_grid.append(mini_card)
+
+        # staggered fade-in: start all cards invisible, fade in one by one
+        child = self.news_grid.get_first_child()
+        idx = 0
+        while child:
+            child.set_opacity(0)
+            GLib.timeout_add(200 + idx * 150, self._fade_in_child, child)
+            idx += 1
+            child = child.get_next_sibling()
+
+        # decode all cached images in a background thread, then set them at once
+        pending = []
+        for item, _, ih in self._cards:
+            if item.get("image_path") and os.path.exists(item["image_path"]):
+                pending.append(("card", ih, item["image_path"]))
+        for item, ih in getattr(self, '_mini_img_holders', []):
+            if item.get("image_path") and os.path.exists(item["image_path"]):
+                pending.append(("mini", ih, item["image_path"]))
+
+        def decode_all():
+            decoded = []
+            for kind, holder, path in pending:
+                try:
+                    if kind == "card":
+                        pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 800, 400, True)
+                    else:
+                        pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 400, 200, True)
+                    decoded.append((kind, holder, pb))
+                except Exception:
+                    pass
+            GLib.idle_add(self._apply_decoded_images, decoded)
+
+        threading.Thread(target=decode_all, daemon=True).start()
+
+        # fetch any missing images in background
+        threading.Thread(target=self._load_images, daemon=True).start()
+
+    def _fade_in_child(self, child):
+        """Animate a single FlowBox child fading in."""
+        child._fade_step = 0
+        def tick():
+            child._fade_step += 1
+            p = min(1.0, child._fade_step / 20.0)
+            child.set_opacity(p)
+            return p < 1.0
+        GLib.timeout_add(16, tick)
+        return False
+
+    def _apply_decoded_images(self, decoded):
+        """Set pre-decoded pixbufs onto card widgets (fast, no I/O)."""
+        for kind, holder, pb in decoded:
+            try:
+                tex = Gdk.Texture.new_for_pixbuf(pb)
+                img = Gtk.Picture.new_for_paintable(tex)
+                img.set_content_fit(Gtk.ContentFit.COVER)
+                img.set_halign(Gtk.Align.FILL)
+                img.set_hexpand(True)
+                if kind == "card":
+                    img.set_size_request(-1, 200)
+                    img.add_css_class("card-image")
+                    img_frame = Gtk.Box()
+                    img_frame.set_size_request(-1, 200)
+                    img_frame.set_overflow(Gtk.Overflow.HIDDEN)
+                    img_frame.set_halign(Gtk.Align.FILL)
+                    img_frame.set_hexpand(True)
+                    img_frame.append(img)
+                    c = holder.get_first_child()
+                    if c: holder.remove(c)
+                    holder.append(img_frame)
+                else:
+                    img.set_size_request(-1, 80)
+                    img.set_hexpand(True)
+                    img.add_css_class("mini-image")
+                    img_frame = Gtk.Box()
+                    img_frame.set_size_request(-1, 80)
+                    img_frame.set_overflow(Gtk.Overflow.HIDDEN)
+                    img_frame.set_halign(Gtk.Align.FILL)
+                    img_frame.set_hexpand(True)
+                    img_frame.append(img)
+                    c = holder.get_first_child()
+                    if c: holder.remove(c)
+                    holder.append(img_frame)
+                holder.set_visible(True)
+            except Exception:
+                pass
+        return False
+
+    def _load_images(self):
+        threads = []
+        # main cards — skip if image already loaded
+        for i, (item, _, holder) in enumerate(self._cards):
+            if item.get("image_path") and os.path.exists(item.get("image_path", "")):
+                continue
+            def dl(idx=i, it=item, h=holder):
+                img_url = it.get("image_url", "")
+                if not img_url and it.get("link"):
+                    img_url = _fetch_og_image(it["link"])
+                    it["image_url"] = img_url
+                path = _download_image(img_url, idx)
+                if path:
+                    it["image_path"] = path
+                    GLib.idle_add(self._set_card_image, h, path)
+            t = threading.Thread(target=dl, daemon=True)
+            t.start()
+            threads.append(t)
+        # mini card images — skip if already loaded
+        for j, (item, holder) in enumerate(getattr(self, '_mini_img_holders', [])):
+            if item.get("image_path") and os.path.exists(item.get("image_path", "")):
+                continue
+            def dl_mini(idx=j + 100, it=item, h=holder):
+                img_url = it.get("image_url", "")
+                if not img_url and it.get("link"):
+                    img_url = _fetch_og_image(it["link"])
+                    it["image_url"] = img_url
+                path = _download_image(img_url, idx)
+                if path:
+                    it["image_path"] = path
+                    GLib.idle_add(self._set_mini_image, h, path)
+            t = threading.Thread(target=dl_mini, daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads: t.join(timeout=5)
+
+    def _set_mini_image(self, holder, path):
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 400, 200, True)
+            tex = Gdk.Texture.new_for_pixbuf(pb)
+            img = Gtk.Picture.new_for_paintable(tex)
+            img.set_content_fit(Gtk.ContentFit.COVER)
+            img.set_size_request(-1, 80)
+            img.set_halign(Gtk.Align.FILL)
+            img.set_hexpand(True)
+            img.add_css_class("mini-image")
+            img_frame = Gtk.Box()
+            img_frame.set_size_request(-1, 80)
+            img_frame.set_overflow(Gtk.Overflow.HIDDEN)
+            img_frame.set_halign(Gtk.Align.FILL)
+            img_frame.set_hexpand(True)
+            img_frame.append(img)
+            c = holder.get_first_child()
+            if c: holder.remove(c)
+            holder.append(img_frame)
+            holder.set_visible(True)
+        except Exception as e:
+            print(f"Mini image error: {e}")
+
+    def _set_card_image(self, holder, path):
+        try:
+            # load at high res, GTK will scale down for display
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 800, 400, True)
+            tex = Gdk.Texture.new_for_pixbuf(pb)
+            img = Gtk.Picture.new_for_paintable(tex)
+            img.set_content_fit(Gtk.ContentFit.COVER)
+            img.set_size_request(400, 200)
+            img.add_css_class("card-image")
+            img.set_halign(Gtk.Align.FILL)
+            # clip height with a fixed-size container
+            img_frame = Gtk.Box()
+            img_frame.set_size_request(400, 200)
+            img_frame.set_overflow(Gtk.Overflow.HIDDEN)
+            img_frame.append(img)
+            c = holder.get_first_child()
+            if c: holder.remove(c)
+            holder.append(img_frame)
+            holder.set_visible(True)
+        except Exception:
+            pass
+
+    def _make_card(self, item):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class("news-card")
+        card.set_size_request(400, -1)
+        ih = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        ih.set_visible(False)
+        ih.set_halign(Gtk.Align.FILL)
+        ih.set_hexpand(True)
+        card.append(ih)
+        tb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        tb.set_margin_start(16); tb.set_margin_end(16)
+        tb.set_margin_top(12); tb.set_margin_bottom(14)
+        # source + date row
+        src_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        src_row.set_halign(Gtk.Align.START)
+        s = Gtk.Label(label=item["source"].upper())
+        s.add_css_class("card-source")
+        src_row.append(s)
+        pub = item.get("published", "")
+        if pub:
+            d = Gtk.Label(label=pub)
+            d.add_css_class("card-date")
+            src_row.append(d)
+        tb.append(src_row)
+
+        t = Gtk.Label(label=item["title"])
+        t.add_css_class("card-title"); t.set_halign(Gtk.Align.START)
+        t.set_wrap(True); t.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        t.set_max_width_chars(38); t.set_xalign(0)
+        tb.append(t)
+        if item["summary"]:
+            sm = Gtk.Label(label=item["summary"])
+            sm.add_css_class("card-summary"); sm.set_halign(Gtk.Align.START)
+            sm.set_wrap(True); sm.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            sm.set_max_width_chars(38); sm.set_xalign(0)
+            tb.append(sm)
+        card.append(tb)
+        return card, ih
+
+    def _make_mini_grid(self, items):
+        """Create a 2x2 grid of compact news items for the 6th card slot."""
+        self._mini_items = items[:4]
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        outer.set_size_request(400, -1)
+
+        grid = Gtk.Grid()
+        grid.set_column_spacing(10)
+        grid.set_row_spacing(10)
+        grid.set_column_homogeneous(True)
+        grid.set_row_homogeneous(True)
+        grid.set_vexpand(True)
+        grid.set_hexpand(True)
+
+        self._mini_img_holders = []
+
+        for i, item in enumerate(items[:4]):
+            mini = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            mini.add_css_class("mini-card")
+            mini.set_overflow(Gtk.Overflow.HIDDEN)
+            mini.set_vexpand(True)
+            mini.set_hexpand(True)
+            mini.set_valign(Gtk.Align.FILL)
+
+            # image holder
+            ih = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            ih.set_visible(False)
+            ih.set_halign(Gtk.Align.FILL)
+            ih.set_hexpand(True)
+            mini.append(ih)
+            self._mini_img_holders.append((item, ih))
+
+            # text
+            tb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            tb.set_margin_start(8); tb.set_margin_end(8)
+            tb.set_margin_top(6); tb.set_margin_bottom(8)
+
+            src = Gtk.Label(label=item["source"].upper())
+            src.add_css_class("mini-source")
+            src.set_halign(Gtk.Align.START)
+            tb.append(src)
+
+            title = Gtk.Label(label=item["title"])
+            title.add_css_class("mini-title")
+            title.set_halign(Gtk.Align.START)
+            title.set_wrap(True)
+            title.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            title.set_max_width_chars(22)
+            title.set_xalign(0)
+            title.set_lines(2)
+            title.set_ellipsize(Pango.EllipsizeMode.END)
+            tb.append(title)
+
+            mini.append(tb)
+
+            # click handler
+            click = Gtk.GestureClick()
+            click.connect("pressed", self._on_mini_clicked, i)
+            mini.add_controller(click)
+
+            row = i // 2
+            col = i % 2
+            grid.attach(mini, col, row, 1, 1)
+
+        outer.append(grid)
+        return outer
+
+    def _on_mini_clicked(self, gesture, n_press, x, y, index):
+        """Handle click on a mini card — open browser if no text, else expand."""
+        if self._article_open:
+            return
+        item = self._mini_items[index]
+
+        # browser-only items open directly in browser
+        if item.get("browser_only") and item.get("link"):
+            self._open_in_browser(gesture, n_press, x, y, item["link"])
+            return
+        self._article_open = True
+        self._expanded_index = -2  # special marker for mini expansion
+        self._is_mini_expand = True
+        self._dragging = False
+        self._did_move = False
+        self._current_shift = 0
+
+        # create a temp card, append to flowbox
+        card, ih = self._make_card(item)
+        self.news_grid.append(card)
+        self._mini_temp_card = card
+
+        # set image
+        if item.get("image_path") and os.path.exists(item["image_path"]):
+            self._set_card_image(ih, item["image_path"])
+
+        # hide everything else
+        child = self.news_grid.get_first_child()
+        while child:
+            if child is not card.get_parent():  # FlowBoxChild wraps card
+                child.set_visible(False)
+            child = child.get_next_sibling()
+
+        # also check by iterating and matching the card's FlowBoxChild
+        child = self.news_grid.get_first_child()
+        while child:
+            inner = child.get_child() if hasattr(child, 'get_child') else None
+            if inner is card:
+                child.set_visible(True)
+            else:
+                child.set_visible(False)
+            child = child.get_next_sibling()
+
+        self._hint.set_visible(False)
+        self._refresh_btn.set_visible(False)
+        self.news_grid.set_max_children_per_line(1)
+        self.news_grid.set_min_children_per_line(1)
+        self._content.set_valign(Gtk.Align.START)
+
+        # add article content to the temp card
+        self._article_widgets = []
+
+        div = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        div.add_css_class("article-divider")
+        div.set_margin_start(24); div.set_margin_end(24)
+        card.append(div)
+        self._article_widgets.append(div)
+
+        # action row: back + open in browser
+        action_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        action_row.set_margin_start(24); action_row.set_margin_end(24)
+        action_row.set_margin_top(6)
+
+        back = Gtk.Label(label="\u2190  back to news")
+        back.add_css_class("back-btn")
+        back_click = Gtk.GestureClick()
+        back_click.connect("pressed", lambda *_: self._collapse_card())
+        back.add_controller(back_click)
+        action_row.append(back)
+
+        if item.get("link"):
+            open_link = Gtk.Label(label="\u2197  open in browser")
+            open_link.add_css_class("open-link")
+            click_open = Gtk.GestureClick()
+            click_open.connect("pressed", self._open_in_browser, item["link"])
+            open_link.add_controller(click_open)
+            action_row.append(open_link)
+
+        card.append(action_row)
+        self._article_widgets.append(action_row)
+
+        self._target_body_h = int(self._screen_height * 0.5)
+        body_scroll = Gtk.ScrolledWindow()
+        body_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        body_scroll.set_max_content_height(self._target_body_h)
+        body_scroll.set_propagate_natural_height(True)
+        body_scroll.add_css_class("article-scroll")
+        self._body_scroll = body_scroll
+
+        self._body_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self._body_box.set_margin_start(24); self._body_box.set_margin_end(24)
+        self._body_box.set_margin_top(8); self._body_box.set_margin_bottom(24)
+
+        body = item.get("full_text", "") or item.get("summary", "")
+        self._add_paragraphs(self._body_box, body)
+
+        body_scroll.set_child(self._body_box)
+        card.append(body_scroll)
+        self._article_widgets.append(body_scroll)
+
+        card.set_size_request(1240, -1)
+
+        # fetch more if short
+        if len(body) < 500 and item.get("link"):
+            def fetch():
+                t = _fetch_article_text(item["link"])
+                if t and len(t) > len(body):
+                    GLib.idle_add(self._replace_body, t)
+            threading.Thread(target=fetch, daemon=True).start()
+
+    # --- article expand/collapse ---
+
+    def _on_card_activated(self, flowbox, child):
+        # don't activate if already viewing an article
+        if self._article_open:
+            return
+        idx = child.get_index()
+        if 0 <= idx < len(self._cards):
+            self._expand_card(idx)
+
+    def _expand_card(self, index):
+        item, card, _ = self._cards[index]
+
+        # browser-only: open in browser instead of expanding
+        if item.get("browser_only") and item.get("link"):
+            self._open_in_browser(None, 0, 0, 0, item["link"])
+            return
+
+        self._article_open = True
+        self._expanded_index = index
+        self._dragging = False
+        self._did_move = False
+        self._current_shift = 0
+
+        # hide all other FlowBox children (including mini-grid)
+        n = 0
+        child = self.news_grid.get_first_child()
+        while child:
+            if n != index:
+                child.set_visible(False)
+            n += 1
+            child = child.get_next_sibling()
+
+        # hide hint and refresh
+        self._hint.set_visible(False)
+        self._refresh_btn.set_visible(False)
+
+        # switch to single column so FlowBox centers the card
+        self.news_grid.set_max_children_per_line(1)
+        self.news_grid.set_min_children_per_line(1)
+        self.news_grid.set_halign(Gtk.Align.CENTER)
+
+        # content aligns to top so card grows downward
+        self._content.set_valign(Gtk.Align.START)
+
+        # add article content to the card
+        self._article_widgets = []
+
+        # divider
+        div = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        div.add_css_class("article-divider")
+        div.set_margin_start(24); div.set_margin_end(24)
+        card.append(div)
+        self._article_widgets.append(div)
+
+        # action row
+        action_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        action_row.set_margin_start(24); action_row.set_margin_end(24)
+        action_row.set_margin_top(6)
+        back = Gtk.Label(label="\u2190  back to news")
+        back.add_css_class("back-btn")
+        back_click = Gtk.GestureClick()
+        back_click.connect("pressed", lambda *_: self._collapse_card())
+        back.add_controller(back_click)
+        action_row.append(back)
+        if item.get("link"):
+            open_link = Gtk.Label(label="\u2197  open in browser")
+            open_link.add_css_class("open-link")
+            click_open = Gtk.GestureClick()
+            click_open.connect("pressed", self._open_in_browser, item["link"])
+            open_link.add_controller(click_open)
+            action_row.append(open_link)
+        card.append(action_row)
+        self._article_widgets.append(action_row)
+
+        # scrollable body area with max height
+        self._target_body_h = int(self._screen_height * 0.5)
+        body_scroll = Gtk.ScrolledWindow()
+        body_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        body_scroll.set_max_content_height(0)  # start at 0, animate open
+        body_scroll.set_propagate_natural_height(True)
+        body_scroll.add_css_class("article-scroll")
+        self._body_scroll = body_scroll
+
+        self._body_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self._body_box.set_margin_start(24); self._body_box.set_margin_end(24)
+        self._body_box.set_margin_top(8); self._body_box.set_margin_bottom(24)
+
+        body = item.get("full_text", "") or item.get("summary", "")
+        if len(body.strip()) < 30:
+            self._add_no_content(self._body_box, item)
+        else:
+            self._add_paragraphs(self._body_box, body)
+
+        body_scroll.set_child(self._body_box)
+        card.append(body_scroll)
+        self._article_widgets.append(body_scroll)
+
+        # set full width immediately (card is already centered by FlowBox)
+        card.set_size_request(1240, -1)
+
+        # animate body height growing
+        self._expand_step = 0
+        GLib.timeout_add(10, self._expand_tick)
+
+        # always try fetching full article if body is short
+        if len(body) < 500 and item.get("link"):
+            self._fetch_item = item
+            def fetch():
+                t = _fetch_article_text(item["link"])
+                if t and len(t) > max(len(body), 50):
+                    GLib.idle_add(self._replace_body, t)
+            threading.Thread(target=fetch, daemon=True).start()
+
+    def _add_no_content(self, container, item):
+        """Show a message when article content can't be loaded."""
+        msg = Gtk.Label(label="Full article not available in reader view.")
+        msg.add_css_class("article-body")
+        msg.set_halign(Gtk.Align.START)
+        msg.set_margin_top(8)
+        container.append(msg)
+
+        if item.get("link"):
+            hint = Gtk.Label(label=f"Click \"open in browser\" above to read the full article at:\n{item['link']}")
+            hint.add_css_class("card-date")
+            hint.set_halign(Gtk.Align.START)
+            hint.set_wrap(True)
+            hint.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            hint.set_max_width_chars(80)
+            hint.set_xalign(0)
+            hint.set_margin_top(8)
+            container.append(hint)
+
+    def _is_heading(self, text):
+        """Detect if a paragraph is likely a heading/subheading."""
+        if len(text) > 80:
+            return False
+        if text.endswith((".", "...", ",")):
+            return False
+        if text.startswith(("- ", "  - ")):
+            return False
+        # short, no period, likely a heading
+        if len(text) < 60 and "\n" not in text:
+            return True
+        return False
+
+    def _add_paragraphs(self, container, text):
+        for para in [p.strip() for p in text.split("\n\n") if p.strip()]:
+            lbl = Gtk.Label(label=para)
+            lbl.set_halign(Gtk.Align.FILL)
+            lbl.set_wrap(True)
+            lbl.set_wrap_mode(Pango.WrapMode.WORD)
+            lbl.set_xalign(0)
+            lbl.set_max_width_chars(120)
+
+            if self._is_heading(para):
+                lbl.add_css_class("article-heading")
+                lbl.set_margin_top(12)
+            else:
+                lbl.add_css_class("article-body")
+                lbl.set_margin_top(4)
+
+            container.append(lbl)
+
+    def _replace_body(self, text):
+        if not hasattr(self, '_body_box') or not self._article_open:
+            return
+        # clear body box and re-add paragraphs
+        child = self._body_box.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self._body_box.remove(child)
+            child = nxt
+        if len(text.strip()) < 30:
+            item = getattr(self, '_fetch_item', {})
+            self._add_no_content(self._body_box, item)
+        else:
+            self._add_paragraphs(self._body_box, text)
+
+    def _expand_tick(self):
+        self._expand_step += 1
+        p = min(1.0, self._expand_step / 25.0)
+        e = 1.0 - (1.0 - p) ** 4  # ease out quart
+
+        h = int(self._target_body_h * e)
+        self._body_scroll.set_max_content_height(h)
+
+        if p >= 1.0:
+            return False
+        return True
+
+    def _collapse_card(self):
+        self._dragging = False
+        self._did_move = False
+        self._current_shift = 0
+        if self._expanded_index < 0 and not getattr(self, '_is_mini_expand', False):
+            return
+        # animate collapse
+        self._collapse_step = 0
+        GLib.timeout_add(10, self._collapse_tick)
+
+    def _collapse_tick(self):
+        self._collapse_step += 1
+        p = min(1.0, self._collapse_step / 18.0)
+        e = p ** 3  # ease in cubic
+
+        # shrink body height
+        h = int(self._target_body_h * (1.0 - e))
+        self._body_scroll.set_max_content_height(max(0, h))
+
+        if p >= 1.0:
+            is_mini = getattr(self, '_is_mini_expand', False)
+
+            if is_mini:
+                # remove the temporary card's FlowBoxChild
+                temp = getattr(self, '_mini_temp_card', None)
+                if temp:
+                    # find and remove the FlowBoxChild containing this card
+                    child = self.news_grid.get_first_child()
+                    while child:
+                        nxt = child.get_next_sibling()
+                        inner = child.get_child() if hasattr(child, 'get_child') else None
+                        if inner is temp:
+                            self.news_grid.remove(child)
+                            break
+                        child = nxt
+                self._mini_temp_card = None
+                self._is_mini_expand = False
+            else:
+                # regular card cleanup
+                _, crd, _ = self._cards[self._expanded_index]
+                for widget in self._article_widgets:
+                    crd.remove(widget)
+                crd.set_size_request(400, -1)
+
+            self._article_widgets = []
+
+            # show all remaining cards
+            child = self.news_grid.get_first_child()
+            while child:
+                child.set_visible(True)
+                child.set_opacity(1.0)
+                child = child.get_next_sibling()
+
+            # restore grid layout
+            self.news_grid.set_max_children_per_line(3)
+            self.news_grid.set_min_children_per_line(2)
+
+            self._hint.set_visible(True)
+            self._hint.set_opacity(1.0)
+            self._refresh_btn.set_visible(True)
+            self._content.set_valign(Gtk.Align.CENTER)
+            self._article_open = False
+            self._expanded_index = -1
+
+            adj = self._scroll.get_vadjustment()
+            if adj:
+                adj.set_value(0)
+            return False
+        return True
+
+    # --- input ---
+
+    def _open_in_browser(self, gesture, n_press, x, y, url):
+        """Open URL in default browser and close screensaver."""
+        import subprocess
+        try:
+            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        # close the screensaver so user sees the browser
+        GLib.timeout_add(200, self.quit)
+
+    def _on_key(self, controller, keyval, keycode, state):
+        if keyval in (Gdk.KEY_Escape, Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            if self._article_open or getattr(self, '_is_mini_expand', False):
+                self._collapse_card()
+                return True
+            elif keyval == Gdk.KEY_Escape:
+                self.quit()
+                return True
+        return False
+
+    def _on_press(self, gesture, n_press, x, y):
+        self._dragging = True
+        self._drag_start_x = x; self._drag_start_y = y
+        self._did_move = False
+
+    def _on_release(self, gesture, n_press, x, y):
+        if not self._dragging: return
+        self._dragging = False
+        if self._dismissing: return
+        dx = abs(x - self._drag_start_x)
+        dy = abs(y - self._drag_start_y)
+        if dx < CLICK_THRESHOLD and dy < CLICK_THRESHOLD:
+            if self._article_open:
+                self._collapse_card()
+            return
+        if not self._article_open:
+            if self._current_shift > DRAG_THRESHOLD:
+                self._animate_dismiss()
+            else:
+                self._current_shift = 0
+                self._panel.set_margin_top(0)
+
+    def _on_motion(self, controller, x, y):
+        if not self._dragging or self._dismissing or self._article_open: return
+        dx = abs(x - self._drag_start_x)
+        dy = abs(y - self._drag_start_y)
+        if dx > CLICK_THRESHOLD or dy > CLICK_THRESHOLD:
+            self._did_move = True
+        delta = self._drag_start_y - y
+        if delta > 0 and self._did_move:
+            self._current_shift = delta
+            # rubber-band: drag slows down the further you pull
+            if delta > DRAG_THRESHOLD:
+                excess = delta - DRAG_THRESHOLD
+                visual = DRAG_THRESHOLD + excess * 0.3
+            else:
+                visual = delta
+            self._panel.set_margin_top(int(-visual))
+
+    def _on_scroll(self, controller, dx, dy):
+        if self._article_open or self._dismissing: return
+        if dy < -2:
+            self._current_shift = DRAG_THRESHOLD + 1
+            self._animate_dismiss()
+
+    def _animate_dismiss(self):
+        self._dismissing = True
+        self._anim_step = 0
+        self._anim_start = self._current_shift
+        GLib.timeout_add(12, self._dismiss_tick)
+
+    def _dismiss_tick(self):
+        self._anim_step += 1
+        p = min(1.0, self._anim_step / 20.0)
+        e = 1.0 - (1.0 - p) ** 3
+        c = self._anim_start + (self._screen_height - self._anim_start) * e
+        self._panel.set_margin_top(int(-c))
+        if p >= 1.0:
+            self.quit()
+            return False
+        return True
+
+    def _get_css(self):
+        return """
+        window, window.background, window.background.csd { background: transparent; }
+        .screensaver-bg { background-color: transparent; }
+        .screensaver-tint { background-color: rgba(10,10,14,0.45); }
+        .clock {
+            font-size: 80px; font-weight: 200; letter-spacing: 2px;
+            font-family: "SF Pro Display","Helvetica Neue","Inter",sans-serif;
+            color: rgba(255,255,255,0.95);
+        }
+        .date-label {
+            font-size: 18px; font-weight: 300; margin-top: -8px;
+            font-family: "SF Pro Display","Helvetica Neue","Inter",sans-serif;
+            color: rgba(255,255,255,0.55);
+        }
+        .sep { background-color: rgba(255,255,255,0.08); min-height: 1px; }
+        .loading { font-size: 14px; color: rgba(255,255,255,0.35); }
+        .refresh-btn {
+            font-size: 15px; font-weight: 500; letter-spacing: 0.5px;
+            color: rgba(120,180,255,0.75);
+            padding: 10px 24px;
+            border-radius: 12px;
+            background-color: rgba(10,10,18,0.5);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .refresh-btn:hover {
+            color: rgba(120,180,255,1.0);
+            background-color: rgba(10,10,18,0.7);
+            border-color: rgba(255,255,255,0.2);
+        }
+        .hint-arrow { font-size: 20px; color: rgba(255,255,255,0.25); }
+        .hint { font-size: 12px; color: rgba(255,255,255,0.2); letter-spacing: 1.5px; }
+
+        flowboxchild {
+            background: transparent; outline: none; border: none;
+            transition: opacity 250ms ease;
+        }
+        flowboxchild:selected, flowboxchild:focus, flowboxchild:active {
+            background: transparent; outline: none;
+        }
+
+        .news-card {
+            background-color: rgba(10,10,18,0.65);
+            border-radius: 16px;
+            border: 1px solid rgba(255,255,255,0.08);
+            overflow: hidden;
+        }
+        .news-card:hover {
+            background-color: rgba(10,10,18,0.75);
+            border-color: rgba(255,255,255,0.15);
+        }
+        .card-image {
+            border-radius: 16px 16px 0 0;
+            min-height: 180px;
+            max-height: 200px;
+        }
+        .card-source {
+            font-size: 11px; font-weight: 600; letter-spacing: 1.5px;
+            color: rgba(120,180,255,0.8);
+        }
+        .card-title {
+            font-size: 17px; font-weight: 500;
+            color: rgba(255,255,255,0.92);
+        }
+        .card-summary {
+            font-size: 13px; font-weight: 300;
+            color: rgba(255,255,255,0.45);
+        }
+        .article-divider {
+            background-color: rgba(255,255,255,0.1); min-height: 1px;
+            margin-top: 6px; margin-bottom: 6px;
+        }
+        .back-btn {
+            font-size: 15px; font-weight: 500; letter-spacing: 0.5px;
+            color: rgba(120,180,255,0.75);
+            padding: 10px 24px;
+            border-radius: 12px;
+            background-color: rgba(10,10,18,0.5);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .back-btn:hover {
+            color: rgba(120,180,255,1.0);
+            background-color: rgba(10,10,18,0.7);
+            border-color: rgba(255,255,255,0.2);
+        }
+        .mini-card {
+            background-color: rgba(10,10,18,0.6);
+            border-radius: 10px;
+            border: 1px solid rgba(255,255,255,0.06);
+            overflow: hidden;
+        }
+        .mini-card:hover {
+            background-color: rgba(255,255,255,0.1);
+            border-color: rgba(255,255,255,0.1);
+        }
+        .mini-image {
+            border-radius: 10px 10px 0 0;
+        }
+        .mini-source {
+            font-size: 9px; font-weight: 700; letter-spacing: 1.2px;
+            color: rgba(120,180,255,0.85);
+        }
+        .mini-title {
+            font-size: 13px; font-weight: 600;
+            color: rgba(255,255,255,0.9);
+        }
+        .card-date {
+            font-size: 10px; font-weight: 300;
+            color: rgba(255,255,255,0.35);
+        }
+        .open-link {
+            font-size: 15px; font-weight: 500; letter-spacing: 0.5px;
+            color: rgba(120,220,180,0.75);
+            padding: 10px 24px;
+            border-radius: 12px;
+            background-color: rgba(10,10,18,0.5);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .open-link:hover {
+            color: rgba(120,220,180,1.0);
+            background-color: rgba(10,10,18,0.7);
+            border-color: rgba(255,255,255,0.2);
+        }
+        .article-scroll { background: transparent; }
+        .article-heading {
+            font-size: 19px; font-weight: 600; line-height: 1.4;
+            font-family: "SF Pro Display","Helvetica Neue","Inter",sans-serif;
+            color: rgba(255,255,255,0.92);
+        }
+        .article-body {
+            font-size: 16px; font-weight: 400; line-height: 1.8;
+            font-family: "Georgia","SF Pro Text","Helvetica Neue",serif;
+            color: rgba(255,255,255,0.82);
+        }
+        """
+
+
+if __name__ == "__main__":
+    import signal, glob, atexit
+
+    def cleanup():
+        for f in glob.glob(os.path.join(tempfile.gettempdir(), "news-ss-*")):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+
+    atexit.register(cleanup)
+    signal.signal(signal.SIGTERM, lambda *_: (cleanup(), exit(0)))
+
+    app = NewsScreensaver()
+    app.run()
+    cleanup()

@@ -1,0 +1,7 @@
+[Unit]
+Description=News screensaver cache updater
+
+[Service]
+Type=oneshot
+ExecStart=/home/new_testament/.local/bin/news-cache-updater
+Environment=HOME=/home/new_testament

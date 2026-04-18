@@ -1,0 +1,9 @@
+#!/bin/bash
+# Toggle news screensaver on/off
+if pgrep -f "python3.*news-screensaver" > /dev/null 2>&1; then
+    pkill -f "python3.*news-screensaver"
+else
+    export LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so
+    python3 /home/new_testament/.local/bin/news-screensaver &
+    disown
+fi

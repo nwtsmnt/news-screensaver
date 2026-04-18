@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""
+Background news cache updater.
+- Fetches RSS feeds in parallel
+- Downloads + pre-scales images to card size
+- Pre-fetches article text for short items
+- Retries failed images/text from previous runs
+- Cleans up stale cache files
+- Skips items that fail entirely
+"""
+
+import feedparser, requests, threading, html, re, os, json, sys
+from pathlib import Path
+from datetime import datetime
+
+RSS_FEEDS = [
+    ("Cloudflare", "https://blog.cloudflare.com/rss/", 2),
+    ("The Register", "https://www.theregister.com/headlines.atom", 3),
+    ("Hacker News", "https://hnrss.org/frontpage", 4),
+    ("BBC London", "https://feeds.bbci.co.uk/news/england/london/rss.xml", 3),
+    ("Dark Reading", "https://www.darkreading.com/rss.xml", 2),
+    ("Krebs on Security", "https://krebsonsecurity.com/feed/", 2),
+    ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index", 2),
+]
+MAX_MAIN = 5
+MAX_MINI = 4
+MAX_TOTAL = MAX_MAIN + MAX_MINI
+CACHE_DIR = Path.home() / ".cache" / "news-screensaver"
+CACHE_FILE = CACHE_DIR / "cache.json"
+CACHE_IMG_DIR = CACHE_DIR / "images"
+CARD_IMG_W, CARD_IMG_H = 800, 400
+MINI_IMG_W, MINI_IMG_H = 400, 200
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"})
+
+JUNK_RE = re.compile(
+    r"^\s*(Share|Save|Print|Email|Copy link|Related Topics|More on this story"
+    r"|Follow us|Subscribe|Sign up|Newsletter|Advertisement"
+    r"|Image source|Getty Images|Reuters|PA Media|AFP"
+    r"|Add as preferred on Google|Listen|Watch|Read more"
+    r"|Send your story|\d+ (hour|minute|day|second)s? ago"
+    r"|Article URL:\s*https?://.*|Comments URL:\s*https?://.*"
+    r"|Points:\s*\d+|# Comments:\s*\d+"
+    r"|Available on iOS.*|Download on the App Store"
+    r"|Get it on Google Play)\s*$",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def clean_hn(text):
+    text = re.sub(r"Article URL:\s*https?://\S+", "", text)
+    text = re.sub(r"Comments URL:\s*https?://\S+", "", text)
+    text = re.sub(r"Points:\s*\d+", "", text)
+    text = re.sub(r"# Comments:\s*\d+", "", text)
+    return text.strip()
+
+
+def extract_image(entry):
+    for src in [
+        lambda: entry.get("media_thumbnail", [{}])[0].get("url"),
+        lambda: next((m.get("url") for m in entry.get("media_content", [])
+                       if "image" in m.get("type", "") or
+                       m.get("url", "").endswith((".jpg", ".png", ".webp"))), None),
+        lambda: re.search(r'<img[^>]+src=["\']([^"\']+)["\']',
+                          entry.get("summary", "") +
+                          (entry.get("content", [{}])[0].get("value", "")
+                           if entry.get("content") else ""))
+    ]:
+        try:
+            r = src()
+            if r:
+                return r.group(1) if hasattr(r, "group") else r
+        except (IndexError, StopIteration, TypeError):
+            pass
+    return ""
+
+
+def clean_text(raw):
+    raw = re.sub(r"<script[^>]*>.*?</script>", "", raw, flags=re.DOTALL)
+    raw = re.sub(r"<style[^>]*>.*?</style>", "", raw, flags=re.DOTALL)
+    raw = re.sub(r"<br\s*/?>", "\n", raw)
+    raw = re.sub(r"</p>", "\n\n", raw)
+    raw = re.sub(r"<[^>]+>", "", raw)
+    raw = html.unescape(raw)
+    lines = [s.strip() for s in raw.split("\n")]
+    lines = [l for l in lines if l == "" or (len(l) >= 3 and not JUNK_RE.match(l))]
+    raw = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    return raw[:5000]
+
+
+def extract_full_text(entry):
+    texts = []
+    if entry.get("content"):
+        texts.extend(c.get("value", "") for c in entry["content"])
+    if entry.get("summary_detail", {}).get("value"):
+        texts.append(entry["summary_detail"]["value"])
+    if entry.get("summary"):
+        texts.append(entry["summary"])
+    return clean_text(max(texts, key=len)) if texts else ""
+
+
+def upgrade_url(url):
+    if not url:
+        return url
+    url = re.sub(r"/standard/\d+/", "/standard/960/", url)
+    return url
+
+
+def fetch_og_image(url):
+    if not url:
+        return ""
+    try:
+        r = SESSION.get(url, timeout=4)
+        if r.status_code != 200:
+            return ""
+        for pattern in [
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+        ]:
+            m = re.search(pattern, r.text, re.IGNORECASE)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
+def download_and_scale(url, path, w, h):
+    """Download image, scale to target size, save as JPEG."""
+    if not url:
+        return False
+    url = upgrade_url(url)
+    try:
+        r = SESSION.get(url, timeout=5)
+        if r.status_code != 200 or len(r.content) < 500:
+            return False
+        # save raw first, then scale with PIL if available, else save raw
+        try:
+            from PIL import Image
+            from io import BytesIO
+            img = Image.open(BytesIO(r.content))
+            img = img.convert("RGB")
+            # scale to fit
+            img.thumbnail((w, h), Image.LANCZOS)
+            img.save(path, "JPEG", quality=85)
+            return True
+        except ImportError:
+            # no PIL — save raw, screensaver will scale
+            with open(path, "wb") as f:
+                f.write(r.content)
+            return True
+    except Exception:
+        return False
+
+
+def fetch_article_text(url):
+    if not url:
+        return ""
+    try:
+        r = SESSION.get(url, timeout=5)
+        if r.status_code != 200:
+            return ""
+        t = r.text
+        best = ""
+        for tag in ["article", "main"]:
+            pattern = rf"<{tag}[^>]*>(.*)</{tag}>"
+            m = re.search(pattern, t, re.DOTALL | re.IGNORECASE)
+            if m:
+                candidate = clean_text(m.group(1))
+                if len(candidate) > len(best):
+                    best = candidate
+        if not best:
+            m = re.search(r"<body[^>]*>(.*)</body>", t, re.DOTALL | re.IGNORECASE)
+            if m:
+                best = clean_text(m.group(1))
+        return best[:5000]
+    except Exception:
+        return ""
+
+
+def fetch_feeds():
+    """Fetch all RSS feeds in parallel, return list of items."""
+    items, results = [], [None] * len(RSS_FEEDS)
+
+    def fetch_one(idx, source, url, count):
+        try:
+            feed = feedparser.parse(url, request_headers={"User-Agent": SESSION.headers["User-Agent"]})
+            res = []
+            for entry in feed.entries[:count]:
+                title = html.unescape(entry.get("title", ""))
+                sc = re.sub(r"<[^>]+>", "", html.unescape(entry.get("summary", "")))
+                sc = clean_hn(sc)
+                if len(sc) > 120:
+                    sc = sc[:117] + "..."
+                pub = entry.get("published", entry.get("updated", ""))
+                try:
+                    from email.utils import parsedate_to_datetime
+                    dt = parsedate_to_datetime(pub)
+                    pub_str = dt.strftime("%d %b %Y, %H:%M")
+                except Exception:
+                    pub_str = pub[:20] if pub else ""
+
+                full = extract_full_text(entry)
+                res.append({
+                    "source": source, "title": title, "summary": sc,
+                    "full_text": full,
+                    "link": entry.get("link", ""), "published": pub_str,
+                    "image_url": extract_image(entry),
+                })
+            results[idx] = res
+        except Exception as e:
+            log(f"  Feed error [{source}]: {e}")
+            results[idx] = []
+
+    threads = [threading.Thread(target=fetch_one, args=(i, s, u, c), daemon=True)
+               for i, (s, u, c) in enumerate(RSS_FEEDS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=8)
+
+    for r in results:
+        if r:
+            items.extend(r)
+    return items[:MAX_TOTAL]
+
+
+def process_items(items):
+    """Download images, fetch article text, all in parallel."""
+    CACHE_IMG_DIR.mkdir(parents=True, exist_ok=True)
+
+    def process_one(idx, item):
+        img_url = item.get("image_url", "")
+
+        # try og:image if no RSS image
+        if not img_url and item.get("link"):
+            img_url = fetch_og_image(item["link"])
+            item["image_url"] = img_url
+
+        # download + pre-scale image (all at card size, screensaver handles display)
+        if img_url:
+            img_path = str(CACHE_IMG_DIR / f"raw-{idx}.jpg")
+            ok = download_and_scale(img_url, img_path, CARD_IMG_W, CARD_IMG_H)
+            item["cached_image"] = img_path if ok else ""
+        else:
+            item["cached_image"] = ""
+
+        # pre-fetch article text if short
+        full = item.get("full_text", "")
+        if len(full) < 500 and item.get("link"):
+            fetched = fetch_article_text(item["link"])
+            if fetched and len(fetched) > len(full):
+                item["full_text"] = fetched
+
+    threads = []
+    for i, item in enumerate(items):
+        t = threading.Thread(target=process_one, args=(i, item), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=12)
+
+
+def cleanup_old_images(items):
+    """Remove cached images not referenced by current items."""
+    used = set()
+    for item in items:
+        ci = item.get("cached_image", "")
+        if ci:
+            used.add(os.path.basename(ci))
+    if CACHE_IMG_DIR.exists():
+        for f in CACHE_IMG_DIR.iterdir():
+            if f.name not in used and f.name != "wallpaper-bg.jpg":
+                f.unlink(missing_ok=True)
+
+
+def save_cache(items):
+    """Save items to cache JSON. Sort: items with article text first (main cards),
+    items without text last (mini grid — browser-only)."""
+    valid = [i for i in items if i.get("title", "").strip()]
+
+    # split into readable vs browser-only
+    has_text = [i for i in valid if len(i.get("full_text", "")) > 100]
+    no_text = [i for i in valid if len(i.get("full_text", "")) <= 100]
+
+    # mark browser-only items
+    for item in no_text:
+        item["browser_only"] = True
+
+    # main cards from readable, mini grid from browser-only + overflow
+    sorted_items = has_text[:MAX_MAIN] + no_text + has_text[MAX_MAIN:]
+    sorted_items = sorted_items[:MAX_TOTAL]
+
+    # copy images to final numbered positions
+    import shutil
+    for i, item in enumerate(sorted_items):
+        src = item.get("cached_image", "")
+        if src and os.path.exists(src):
+            dst = str(CACHE_IMG_DIR / f"img-{i}.jpg")
+            try:
+                shutil.copy2(src, dst)
+                item["cached_image"] = dst
+            except Exception:
+                item["cached_image"] = ""
+        else:
+            item["cached_image"] = ""
+
+    # clean up raw-* temp files
+    for f in CACHE_IMG_DIR.glob("raw-*"):
+        f.unlink(missing_ok=True)
+
+    data = {
+        "updated": datetime.now().isoformat(),
+        "items": sorted_items,
+    }
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CACHE_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    return valid
+
+
+def main():
+    log("Fetching news feeds...")
+    items = fetch_feeds()
+    log(f"  Got {len(items)} items")
+
+    if not items:
+        log("  No items fetched, keeping existing cache")
+        return
+
+    log("Processing images + article text...")
+    process_items(items)
+
+    img_count = sum(1 for i in items if i.get("cached_image"))
+    text_count = sum(1 for i in items if len(i.get("full_text", "")) > 100)
+    log(f"  Images: {img_count}/{len(items)}, Article text: {text_count}/{len(items)}")
+
+    log("Saving cache + cleanup...")
+    valid = save_cache(items)
+    cleanup_old_images(valid)
+
+    log(f"Done. {len(valid)} items cached at {CACHE_FILE}")
+
+
+if __name__ == "__main__":
+    main()
